@@ -19,6 +19,8 @@ use core::sync::atomic::Ordering::*;
 
 pub(crate) use self::list::{LocalNode, Node};
 use super::RefCnt;
+#[cfg(feature = "internal-test-strategies")]
+use crate::strategy::test_hooks::{self, HookPoint};
 
 mod fast;
 mod helping;
@@ -83,6 +85,8 @@ impl Debt {
         T: RefCnt,
         R: Fn() -> T,
     {
+        #[cfg(feature = "internal-test-strategies")]
+        test_hooks::fire(HookPoint::WriterPayAllStart, storage_addr);
         LocalNode::with(|local| {
             let val = unsafe { T::from_ptr(ptr) };
             // Pre-pay one ref count that can be safely put into a debt slot to pay it.
@@ -92,7 +96,11 @@ impl Debt {
                 // Make the cooldown trick know we are poking into this node.
                 let _reservation = node.reserve_writer();
 
+                #[cfg(feature = "internal-test-strategies")]
+                test_hooks::fire(HookPoint::WriterNodeBeforeHelp, storage_addr);
                 local.help(node, storage_addr, &replacement);
+                #[cfg(feature = "internal-test-strategies")]
+                test_hooks::fire(HookPoint::WriterNodeAfterHelp, storage_addr);
 
                 let all_slots = node
                     .fast_slots()
@@ -106,6 +114,8 @@ impl Debt {
                         T::inc(&val);
                     }
                 }
+                #[cfg(feature = "internal-test-strategies")]
+                test_hooks::fire(HookPoint::WriterNodeSlotsDone, storage_addr);
 
                 None
             });

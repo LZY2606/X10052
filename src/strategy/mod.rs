@@ -55,6 +55,10 @@ mod rw_lock;
 #[cfg(feature = "internal-test-strategies")]
 #[doc(hidden)]
 pub mod test_strategies;
+// Test-only interleave hooks. Do not use from outside of the crate.
+#[cfg(feature = "internal-test-strategies")]
+#[doc(hidden)]
+pub mod test_hooks;
 
 use self::hybrid::{DefaultConfig, HybridStrategy};
 

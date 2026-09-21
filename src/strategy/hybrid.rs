@@ -23,6 +23,8 @@ use core::sync::atomic::Ordering::*;
 use super::sealed::{CaS, InnerStrategy, Protected};
 use crate::debt::{Debt, LocalNode};
 use crate::ref_cnt::RefCnt;
+#[cfg(feature = "internal-test-strategies")]
+use crate::strategy::test_hooks::{self, HookPoint};
 
 pub struct HybridProtection<T: RefCnt> {
     debt: Option<&'static Debt>,
@@ -49,6 +51,8 @@ impl<T: RefCnt> HybridProtection<T> {
         // Acquire to get the data.
         //
         // SeqCst to make sure the storage vs. the debt are well ordered.
+        #[cfg(feature = "internal-test-strategies")]
+        test_hooks::fire(HookPoint::FastPreConfirm, storage as *const _ as usize);
         let confirm = storage.load(SeqCst);
         if ptr == confirm {
             // Successfully got a debt
@@ -72,9 +76,15 @@ impl<T: RefCnt> HybridProtection<T> {
         // First, we claim a debt slot and store the address of the atomic pointer there, so the
         // writer can optionally help us out with loading and protecting something.
         let gen = node.new_helping(storage as *const _ as usize);
+        // The generation is published from this point; a writer can now observe the collision
+        // (test-only audit point, see strategy::test_hooks).
+        #[cfg(feature = "internal-test-strategies")]
+        test_hooks::fire(HookPoint::FallbackReserved, storage as *const _ as usize);
         // Need SeqCst to make sure the candidate is not outdated and already freed. Otherwise, we
         // could "successfully" protect an already freed pointer.
         let candidate = storage.load(SeqCst);
+        #[cfg(feature = "internal-test-strategies")]
+        test_hooks::fire(HookPoint::FallbackLoaded, storage as *const _ as usize);
 
         // Try to replace the debt with our candidate. If it works, we get the debt slot to use. If
         // not, we get a replacement value, already protected and a debt to take care of.
@@ -221,12 +231,18 @@ impl<T: RefCnt, Cfg: Config> CaS<T> for HybridStrategy<Cfg> {
             }
             // If they are still equal, put the new one in.
             let new_raw = T::as_ptr(&new);
+            // Observation is done; the installation point is the CAS below. Audit hook sits
+            // strictly between the two, which is the window in which a losing CAS must retry.
+            #[cfg(feature = "internal-test-strategies")]
+            test_hooks::fire(HookPoint::CasObservedEqual, storage as *const _ as usize);
             if storage
                 .compare_exchange_weak(current.as_raw(), new_raw, SeqCst, Relaxed)
                 .is_ok()
             {
                 // We successfully put the new value in. The ref count went in there too.
                 T::into_ptr(new);
+                #[cfg(feature = "internal-test-strategies")]
+                test_hooks::fire(HookPoint::CasWon, storage as *const _ as usize);
                 <Self as InnerStrategy<T>>::wait_for_readers(self, old.as_ptr(), storage);
                 // We just got one ref count out of the storage and we have one in old. We don't
                 // need two.
