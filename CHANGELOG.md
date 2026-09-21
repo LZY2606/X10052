@@ -1,3 +1,46 @@
+# Unreleased
+
+* Audit of debt helping, guard fallback and CAS linearization points, documented in
+  `ANALYSIS.md` (entry points, shared state, cache interaction, error propagation and
+  outputs, traced along `load` / `compare_and_swap` / `wait_for_readers` / guard drop /
+  `into_inner`). No library code was changed; the audit is backed by a new executable
+  litmus suite in `tests/litmus.rs`.
+
+* New litmus suite (`tests/litmus.rs`), each test able to falsify one design assumption:
+  * `guards_beyond_fast_slots_use_fallback`: a single thread holding more guards than
+    the 8 fast debt slots; pins the exact ref-count accounting of the helping fallback.
+  * `guard_into_inner_releases_debt`: `Guard::into_inner` must release/convert every
+    debt exactly once.
+  * `churn_*`: barrier-phased reader/writer churn asserting every value generation is
+    dropped exactly once (no double drop, no leak), instantiated for the default
+    strategy, the forced-fallback strategy (`FillFastSlots`, so every load exercises
+    debt helping) and the `RwLock<()>` test strategy as a cross-check.
+  * `cas_exactly_one_winner_*` / `store_vs_cas_race_*`: writer-vs-CAS races; exactly
+    one of two competing CAS operations may win, and a failed CAS must observe the
+    value that replaced its `current`.
+  * `step_trace_matches_rw_lock`: a deterministic operation script whose step-by-step
+    observable trace must be identical across the hybrid, forced-fallback and
+    `RwLock<()>` strategies.
+
+* Coverage gaps closed: previously no test forced the helping fallback deterministically
+  on every load, no test pinned the exact debt accounting when a thread exceeds the fast
+  slots, and CAS outcomes were not cross-checked against the `RwLock<()>` strategy.
+
+* Adjacent-semantics regression protection: the exactly-once drop assertions observe
+  state only after all guards are dropped, so the intentional delayed reclamation of
+  `Cache` is not misreported as a leak; `Guard::into_inner`/`load_full` ownership
+  semantics and the `ArcSwapOption`-shared debt slots remain covered by the existing
+  stress/random suites.
+
+* Most dangerous counterexample on record (lock-free reference replacement / debt
+  helping / memory ordering): without SeqCst/Acquire on `Debt::pay`, the compensating
+  `fetch_add` from a writer paying a debt may become visible to the reader thread only
+  after `Arc`'s dropping `fetch_sub` already observed itself as the last reference,
+  freeing the allocation while the writer still bumps ref counts in it (the 1.9.0
+  ordering-bug class, #198/#200/#204). Regression coverage: `churn_forced_fallback`
+  (every load forced through the helping path under lock-step writer pressure) together
+  with `guards_beyond_fast_slots_use_fallback` (exact debt accounting).
+
 # 1.9.2
 
 * Document RefCnt must not panic (#208).
