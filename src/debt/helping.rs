@@ -280,6 +280,8 @@ impl Slots {
                         .compare_exchange(control, space_addr, SeqCst, SeqCst)
                     {
                         Ok(_) => {
+                            #[cfg(feature = "internal-test-strategies")]
+                            crate::litmus::count(crate::litmus::HELP_SUCCESS);
                             // We have successfully sent our replacement out (Release) and got
                             // their space in return (Acquire on that load above).
                             self.space_offer.store(their_space, SeqCst);
@@ -311,6 +313,12 @@ impl Slots {
         // is observable by the other thread (but that's probably not necessary anyway?)
         let prev = self.slot.0.swap(ptr, SeqCst);
         debug_assert_eq!(Debt::NONE, prev);
+
+        // Audit probe: the reader's debt is now installed in the helping slot while the control
+        // still advertises the generation, so a writer both helps the control and may pay this
+        // very slot. Only present in internal-test builds.
+        #[cfg(feature = "internal-test-strategies")]
+        crate::litmus::checkpoint(crate::litmus::CP_FALLBACK_CONFIRM);
 
         // Confirm by writing to the control (or discover that we got helped). We stop anyone else
         // from helping by setting it to IDLE.

@@ -142,6 +142,8 @@ mod as_raw;
 pub mod cache;
 mod compile_fail_tests;
 mod debt;
+#[cfg(feature = "internal-test-strategies")]
+pub mod litmus;
 pub mod docs;
 mod ref_cnt;
 #[cfg(feature = "serde")]

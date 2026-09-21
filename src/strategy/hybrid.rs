@@ -23,6 +23,8 @@ use core::sync::atomic::Ordering::*;
 use super::sealed::{CaS, InnerStrategy, Protected};
 use crate::debt::{Debt, LocalNode};
 use crate::ref_cnt::RefCnt;
+#[cfg(feature = "internal-test-strategies")]
+use crate::litmus;
 
 pub struct HybridProtection<T: RefCnt> {
     debt: Option<&'static Debt>,
@@ -45,16 +47,22 @@ impl<T: RefCnt> HybridProtection<T> {
         let ptr = storage.load(SeqCst);
         // Try to get a debt slot. If not possible, fail.
         let debt = node.new_fast(ptr as usize)?;
+        #[cfg(feature = "internal-test-strategies")]
+        litmus::checkpoint(litmus::CP_FAST_CLAIMED);
 
         // Acquire to get the data.
         //
         // SeqCst to make sure the storage vs. the debt are well ordered.
+        #[cfg(feature = "internal-test-strategies")]
+        litmus::checkpoint(litmus::CP_FAST_CONFIRM);
         let confirm = storage.load(SeqCst);
         if ptr == confirm {
             // Successfully got a debt
             // NOTE: we *must* use `confirm` here instead of `ptr`. The address may compare equal,
             // but they could have different provenance, if the pointer is freed and then
             // subsequently reused.
+            #[cfg(feature = "internal-test-strategies")]
+            litmus::count(litmus::FAST_CONFIRMED);
             Some(unsafe { Self::new(confirm, Some(debt)) })
         } else if debt.pay::<T>(ptr) {
             // It changed in the meantime, we return the debt (that is on the outdated pointer,
@@ -63,6 +71,8 @@ impl<T: RefCnt> HybridProtection<T> {
         } else {
             // It changed in the meantime, but the debt for the previous pointer was already paid
             // for by someone else, so we are fine using it.
+            #[cfg(feature = "internal-test-strategies")]
+            litmus::count(litmus::FAST_ALREADY_PAID);
             Some(unsafe { Self::new(ptr, None) })
         }
     }
@@ -72,18 +82,26 @@ impl<T: RefCnt> HybridProtection<T> {
         // First, we claim a debt slot and store the address of the atomic pointer there, so the
         // writer can optionally help us out with loading and protecting something.
         let gen = node.new_helping(storage as *const _ as usize);
+        #[cfg(feature = "internal-test-strategies")]
+        litmus::checkpoint(litmus::CP_FALLBACK_GEN);
         // Need SeqCst to make sure the candidate is not outdated and already freed. Otherwise, we
         // could "successfully" protect an already freed pointer.
         let candidate = storage.load(SeqCst);
+        #[cfg(feature = "internal-test-strategies")]
+        litmus::checkpoint(litmus::CP_FALLBACK_CANDIDATE);
 
         // Try to replace the debt with our candidate. If it works, we get the debt slot to use. If
         // not, we get a replacement value, already protected and a debt to take care of.
         match node.confirm_helping(gen, candidate as usize) {
             Ok(debt) => {
                 // The fast path -> we got the debt confirmed alright.
+                #[cfg(feature = "internal-test-strategies")]
+                litmus::count(litmus::FALLBACK_CONFIRMED);
                 Self::from_inner(unsafe { Self::new(candidate, Some(debt)).into_inner() })
             }
             Err((unused_debt, replacement)) => {
+                #[cfg(feature = "internal-test-strategies")]
+                litmus::count(litmus::FALLBACK_UPGRADED);
                 // The debt is on the candidate we provided and it is unused, we so we just pay it
                 // back right away.
                 if !unused_debt.pay::<T>(candidate) {
@@ -114,10 +132,14 @@ impl<T: RefCnt> Drop for HybridProtection<T> {
             Some(debt) => {
                 let ptr = T::as_ptr(&self.ptr);
                 if debt.pay::<T>(ptr) {
+                    #[cfg(feature = "internal-test-strategies")]
+                    litmus::count(litmus::GUARD_DROP_DEBT_PAID);
                     return;
                 }
                 // But if the debt was already paid for us, we need to release the pointer, as we
                 // were effectively already in the Unprotected mode.
+                #[cfg(feature = "internal-test-strategies")]
+                litmus::count(litmus::GUARD_DROP_ALREADY_PAID);
             }
         }
         // Equivalent to T::dec(ptr)
@@ -141,8 +163,17 @@ impl<T: RefCnt> Protected<T> for HybridProtection<T> {
         match self.debt.take() {
             None => (), // We have a fully loaded ref-counted pointer.
             Some(debt) => {
+                // Audit probe: the guard is about to upgrade itself. A writer swapping here will
+                // find the established debt and pay it, forcing the rollback branch below.
+                #[cfg(feature = "internal-test-strategies")]
+                litmus::checkpoint(litmus::CP_INTO_INNER);
                 let ptr = T::inc(&self.ptr);
-                if !debt.pay::<T>(ptr) {
+                if debt.pay::<T>(ptr) {
+                    #[cfg(feature = "internal-test-strategies")]
+                    litmus::count(litmus::INTO_INNER_DEBT_PAID);
+                } else {
+                    #[cfg(feature = "internal-test-strategies")]
+                    litmus::count(litmus::INTO_INNER_ALREADY_PAID);
                     unsafe { T::dec(ptr) };
                 }
             }

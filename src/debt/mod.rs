@@ -102,6 +102,8 @@ impl Debt {
                     // visible to whoever might acquire on this slot and can't leak below this.
                     // And we are the ones doing decrements anyway.
                     if slot.pay::<T>(ptr) {
+                        #[cfg(feature = "internal-test-strategies")]
+                        crate::litmus::count(crate::litmus::PAY_SLOT);
                         // Pre-pay one more, for another future slot
                         T::inc(&val);
                     }
