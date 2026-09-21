@@ -55,6 +55,10 @@ mod rw_lock;
 #[cfg(feature = "internal-test-strategies")]
 #[doc(hidden)]
 pub mod test_strategies;
+// Deterministic interleaving seams for the internal litmus tests.
+#[cfg(feature = "internal-test-strategies")]
+#[doc(hidden)]
+pub mod test_ctl;
 
 use self::hybrid::{DefaultConfig, HybridStrategy};
 

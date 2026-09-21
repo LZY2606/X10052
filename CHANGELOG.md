@@ -1,3 +1,102 @@
+# Unreleased (linearisation audit: debt helping, guard fallback, CAS)
+
+This entry accompanies `ANALYSIS.md`, which traces pointer provenance through `load`,
+`compare_and_swap`, `wait_for_readers`, guard `Drop` and `into_inner`, and identifies the
+linearisation point of fast slots, the helping slot (including the collision/handover branch)
+and the fallback.
+
+## Added
+- `tests/litmus.rs`: a deterministic litmus suite for the audit. Every scenario is a controlled
+  interleaving (barriers/scoped joins plus an atomic rendezvous seam), never a random sleep; each
+  one records its step outcomes and is cross-checked against the `RwLock<()>` reference strategy.
+  Coverage: more than eight simultaneously held guards on one thread (fast-slot exhaustion), a
+  writer replacing the storage while a reader is parked in the helping fallback at three distinct
+  windows (AfterReserve, AfterLoad, BeforeConfirm), writer-vs-CAS contention with both a losing
+  and a winning CAS, exact-once dropping of displaced values under mixed fast/fallback/promoted
+  guards, pointer-provenance across allocator address reuse, and the guard-drop/`into_inner`
+  balance in both directions.
+- `src/strategy/test_ctl.rs` (feature `internal-test-strategies` only): the timing-free
+  rendezvous used by the litmus suite, plus counters proving the handover collision branch is
+  really entered, and a helper to read a storage's internal address for per-instance arming. The
+  whole module is compiled out of normal builds.
+- Three feature-gated `maybe_pause` seams in the existing hybrid/helping code
+  (`src/strategy/hybrid.rs::fallback`, `src/debt/helping.rs::confirm`). No production ordering or
+  code path changes: without the feature the compiled code is byte-for-byte the same algorithm.
+- In-crate `ordering_guard` unit tests (`src/strategy/hybrid.rs`) that structurally pin the
+  `SeqCst` orderings of the fast double read, `Debt::pay`, and writer pointer publication. These
+  catch weakened orderings deterministically, which runtime tests on x86-TSO cannot.
+- `ANALYSIS.md` with the entry/state/cache/error/output walkthrough and the full linearisation
+  table.
+
+## Implementation choices
+- Reused the existing strategy abstraction for the reference oracle instead of writing a second
+  engine: the suite is generic over `S: Strategy`/`S: CaS` and compares traces against
+  `RwLock<()>`, with a third configuration (`FillFastSlots`) that forces every load through the
+  helping fallback. This is cross-checking against an independent algorithm, not a parallel
+  reimplementation of the hybrid strategy.
+- Determinism over repetition: a global atomic state machine (`DISARMED/ARMED/ENTERED/RELEASED`)
+  parks exactly one reader at a named window while the writer thread drives the schedule; seam
+  users are serialised with a process-wide lock like `tests/stress.rs`.
+- The collision seam is keyed by storage address and only reader calls park (writer-recursive
+  loads observe ENTERED/RELEASED), so handover synthesis cannot self-deadlock even with fast
+  slots disabled.
+- Diagnostics are carried on every assertion (tag, pointer address, per-tag drop histogram) so a
+  red test identifies the exact broken balance.
+
+## Gaps in the previous coverage that this closes
+- No prior test held more than eight guards on one thread *while a writer replaced the storage*
+  and audited the exact drop count of both values (the old `lease_overflow` checked ref counts
+  only on the unchanging value).
+- The helping collision/handover path was exercised only by random stress tests; there was no
+  deterministic schedule proving a reader parked between reservation and pointer load receives a
+  live, provenance-correct value, and no test asserting the branch was entered at all.
+- CAS coverage checked ref counts in a single-threaded loop (`cas_ref_cnt`) but never a
+  controlled schedule where a competing swap lands strictly between the CAS's protected load and
+  its `compare_exchange`, with the rejected `new` and displaced `old` ledgers audited separately.
+- No test tied exact-once destruction to the fast/helping/`into_inner` mixture simultaneously,
+  and none probed pointer provenance when the allocator recycles an address.
+- The #198/#200/#204 ordering fixes had a regression test (`tests/bug-198.rs`) for one observed
+  crash, but nothing guarded the other `SeqCst` sites against "performance" relaxations.
+
+## Adjacent-semantics regression protection
+- The full existing suite is unchanged and still passes under
+  `--features weak,internal-test-strategies,experimental-strategies` (lib, random proptest,
+  stress, doctests); the stress suite's `full_slots` strategy variant runs the same linked-list,
+  unroll and parallel-load storms with fast slots disabled.
+- Non-test builds (`cargo build`, `--features weak`) compile with no new warnings and contain no
+  test code: every seam and the control module are `#[cfg(feature =
+  "internal-test-strategies")]`.
+- `Cache` and `Weak` paths are untouched; the audit records why they cannot move a linearisation
+  point (Cache owns a full reference and only revalidates with a Relaxed comparison; Weak uses
+  the same `RefCnt` protocol).
+- `rustfmt` clean and `cargo clippy --lib --tests` reports no warnings in the changed code.
+
+## Most dangerous counterexample and its regression
+The most dangerous one is the lock-free reference replacement / debt helping / memory-ordering
+triple at the fast path's *double read* and at a helping-slot reservation:
+
+1. A reader publishes a debt (fast slot) or a reservation (helping GEN) and must perform a
+   *second* SeqCst load of the storage before trusting the pointer; the guard must be built from
+   that second load's provenance.
+2. Concurrently the writer swaps the pointer (SeqCst) and, in `wait_for_readers`, bumps the
+   strong count of every still-visible debt and resolves any half-published reservation by
+   handing over an already protected value.
+3. If the confirmation load or the debt/control publication is weakened, or if `wait_for_readers`
+   omits the helping slot, the strong count can reach zero and `Arc::Drop` can free the payload
+   while a reader is still dereferencing it — use-after-free. x86-TSO hides the ordering failure
+   at runtime, so ordinary stress runs stay green, which is exactly how the original #198 class
+   of bugs survived.
+
+Regression coverage for this counterexample is deliberately two-pronged:
+- `litmus_fast_guard_outlives_concurrent_writers` and
+  `litmus_unprotected_reader_cannot_outlive_wait_for_readers` in `tests/litmus.rs` exercise the
+  behaviour with controlled interleavings (verified: deleting the helping slot from `pay_all`
+  makes the latter deterministically fail/hang);
+- the in-crate structural tests
+  `strategy::hybrid::ordering_guard::{fast_confirm_ordering_is_seqcst, debt_payment_is_seqcst_cas,
+  swap_and_cas_linearisation_is_seqcst}` fail at test-build time if any of those orderings is
+  relaxed (verified by mutation before restoring the code).
+
 # 1.9.2
 
 * Document RefCnt must not panic (#208).

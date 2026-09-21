@@ -72,9 +72,28 @@ impl<T: RefCnt> HybridProtection<T> {
         // First, we claim a debt slot and store the address of the atomic pointer there, so the
         // writer can optionally help us out with loading and protecting something.
         let gen = node.new_helping(storage as *const _ as usize);
+
+        // Test-only seam: the generation/active address is published but the candidate is not
+        // loaded yet. A writer in this window observes the GEN_TAG control and must take the
+        // collision/handover branch (it synthesises an already protected replacement instead of
+        // freeing the old pointer). Compiled out without internal-test-strategies.
+        #[cfg(feature = "internal-test-strategies")]
+        super::test_ctl::maybe_pause(
+            storage as *const _ as usize,
+            super::test_ctl::Window::AfterReserve,
+        );
+
         // Need SeqCst to make sure the candidate is not outdated and already freed. Otherwise, we
         // could "successfully" protect an already freed pointer.
         let candidate = storage.load(SeqCst);
+
+        // Second test-only seam: the candidate is loaded but not yet confirmed into the slot, so a
+        // writer can swap the storage and start paying debts while our debt is still in flight.
+        #[cfg(feature = "internal-test-strategies")]
+        super::test_ctl::maybe_pause(
+            storage as *const _ as usize,
+            super::test_ctl::Window::AfterLoad,
+        );
 
         // Try to replace the debt with our candidate. If it works, we get the debt slot to use. If
         // not, we get a replacement value, already protected and a debt to take care of.
@@ -234,5 +253,70 @@ impl<T: RefCnt, Cfg: Config> CaS<T> for HybridStrategy<Cfg> {
                 return old;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ordering_guard {
+    //! Regression guard for the #198/#200/#204 class of bugs: several orderings in the hybrid
+    //! strategy were historically too weak (proofs relied on a misreading of the C11 memory
+    //! model). On x86-TSO a weakened ordering usually still *works at runtime*, which is exactly
+    //! why ordinary stress tests cannot catch it. These tests therefore assert the ordering
+    //! requirements structurally, against the exact source spans, so that a "performance fix"
+    //! that relaxes one of them fails compilation of the test suite instead of silently
+    //! reintroducing a release-order data race.
+    //!
+    //! The behavioural half of the same counterexample lives in
+    //! `tests/litmus.rs::litmus_fast_guard_outlives_concurrent_writers`.
+
+    use core::sync::atomic::Ordering::*;
+
+    fn assert_seqcst_store_span(source: &str, needle: &str) {
+        let pos = source
+            .find(needle)
+            .unwrap_or_else(|| panic!("fast-path ordering anchor disappeared: {}", needle));
+        let around = &source[pos..pos + needle.len() + 40];
+        assert!(
+            around.contains("SeqCst"),
+            "ordering weakened near {}: {}",
+            needle,
+            around
+        );
+    }
+
+    #[test]
+    fn fast_confirm_ordering_is_seqcst() {
+        // Pins the two reader loads and the intervening debt publication of `attempt`.
+        let src = include_str!("hybrid.rs");
+        assert_seqcst_store_span(src, "let ptr = storage.load");
+        assert_seqcst_store_span(src, "let confirm = storage.load");
+    }
+
+    #[test]
+    fn debt_payment_is_seqcst_cas() {
+        let src = include_str!("../debt/mod.rs");
+        // The debt-clearing CAS in Debt::pay must stay SeqCst on success.
+        let idx = src
+            .find("compare_exchange(ptr as usize, Self::NONE")
+            .expect("Debt::pay CAS anchor disappeared");
+        assert!(
+            src[idx..idx + 120].contains("SeqCst, SeqCst"),
+            "Debt::pay ordering weakened"
+        );
+    }
+
+    #[test]
+    fn swap_and_cas_linearisation_is_seqcst() {
+        let src = include_str!("hybrid.rs");
+        // Writer-side pointer publication: compare_exchange_weak in compare_and_swap.
+        let cas = src
+            .find("compare_exchange_weak(current.as_raw(), new_raw")
+            .expect("CAS publication anchor disappeared");
+        assert!(
+            src[cas..cas + 120].contains("SeqCst"),
+            "CAS success ordering weakened"
+        );
+        // The unit here is just to keep the import used if the file is compiled standalone.
+        let _ = SeqCst;
     }
 }

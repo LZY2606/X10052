@@ -237,6 +237,10 @@ impl Slots {
                     // value of the active_addr is in between two same instances, therefore up to
                     // date to it.
                     let active_addr = who.active_addr.load(SeqCst);
+                    #[cfg(feature = "internal-test-strategies")]
+                    if active_addr == storage_addr {
+                        crate::strategy::test_ctl::helper_saw_gen();
+                    }
                     if active_addr != storage_addr {
                         // Acquire for the same reason as on the top.
                         let new_control = who.control.load(SeqCst);
@@ -280,6 +284,8 @@ impl Slots {
                         .compare_exchange(control, space_addr, SeqCst, SeqCst)
                     {
                         Ok(_) => {
+                            #[cfg(feature = "internal-test-strategies")]
+                            crate::strategy::test_ctl::helper_handover_ok();
                             // We have successfully sent our replacement out (Release) and got
                             // their space in return (Acquire on that load above).
                             self.space_offer.store(their_space, SeqCst);
@@ -311,6 +317,15 @@ impl Slots {
         // is observable by the other thread (but that's probably not necessary anyway?)
         let prev = self.slot.0.swap(ptr, SeqCst);
         debug_assert_eq!(Debt::NONE, prev);
+
+        // Test-only seam: the candidate debt is visible in the slot but the generation is still
+        // the active control. The key is the active address, which is the storage address the
+        // reader advertised during get_debt.
+        #[cfg(feature = "internal-test-strategies")]
+        crate::strategy::test_ctl::maybe_pause(
+            self.active_addr.load(Relaxed),
+            crate::strategy::test_ctl::Window::BeforeConfirm,
+        );
 
         // Confirm by writing to the control (or discover that we got helped). We stop anyone else
         // from helping by setting it to IDLE.
